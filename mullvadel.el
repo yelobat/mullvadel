@@ -2,14 +2,14 @@
 ;;
 ;; Copyright (C) 2025 yelobat
 ;;
-;; Author: yelobat <yelobat@fedora>
-;; Maintainer: yelobat <yelobat@fedora>
+;; Author: yelobat
+;; Maintainer: yelobat
 ;; Created: July 06, 2025
 ;; Modified: July 06, 2025
 ;; Version: 0.0.1
 ;; Keywords: transient comm tools unix processes
 ;; Homepage: https://github.com/yelobat/mullvadel
-;; Package-Requires: ((emacs "28.1") (transient "0.9.2") (compat))
+;; Package-Requires: ((emacs "28.1") (transient "0.9.2") (compat "0.7.2"))
 ;;
 ;; This file is not part of GNU Emacs.
 ;;
@@ -27,60 +27,81 @@
 
 (defgroup mullvadel nil
   "Interface with Mullvad VPN."
-  :group 'mullvad-vpn
-  )
+  :group 'mullvadel-vpn)
 
 (defcustom mullvadel-account-number nil
   "Your Mullvad VPN account number."
   :type '(choice
           (string :tag "Account Number")
           (function :tag "Function that returns Account Number"))
-  :group 'mullvadel
-  )
+  :group 'mullvadel)
 
 (defcustom mullvadel-cli-path "mullvad"
   "Path to the Mullvad VPN CLI executable."
   :type 'file
-  :group 'mullvadel
-  )
+  :group 'mullvadel)
+
+(defconst mullvadel-buffer (get-buffer-create "*Mullvadel Buffer*"))
+(defconst mullvadel-error-buffer (get-buffer-create "*Mullvadel Error Buffer*"))
+(defconst mullvadel-process-buffer (get-buffer-create "*Mullvadel Process Buffer*"))
+(defvar mullvadel-process nil)
+(defvar mullvadel-process-output nil)
+
+(defun mullvadel-message (format-string &rest args)
+  "Display FORMAT-STRING in `mullvadel-buffer'."
+  (with-current-buffer mullvadel-buffer
+    (goto-char (point-max))
+    (insert (apply 'format (concat "Mullvad: " format-string "\n") args))))
+
+(defun mullvadel-error (format-string &rest args)
+  "Display FORMAT-STRING in `mullvadel-error-buffer'."
+  (with-current-buffer mullvadel-error-buffer
+    (goto-char (point-max))
+    (insert (apply 'format (concat "Mullvad Error: " format-string "\n") args))))
 
 (defun mullvadel-cli-command-run (args)
   "Run a Mullvad VPN CLI command."
   (let* ((command (concat mullvadel-cli-path " " (mapconcat 'shell-quote-argument args " "))))
-    (message "Running Mullvad CLI: %s" command)
+    (mullvadel-message "Running Mullvad CLI: %s" command)
     (condition-case err
         (let ((output (shell-command-to-string command)))
           (string-trim-right output))
       (error
-       (message "Error running Mullvad VPN CLI command '%s': %S" command err)
-       (error "Mullvad CLI command failed: %S" (cdr err))))))
+       (mullvadel-error "Error running Mullvad VPN CLI command '%s' - %S" command err)
+       (mullvadel-error "Mullvad CLI command failed - %S" (cdr err))))))
 
 ;; Mullvad VPN commands
 (defun mullvadel-status ()
   "Return the state of the VPN tunnel."
   (interactive)
-  (mullvadel-cli-command-run '("status")))
+  (mullvadel-shell-to-string '("status")))
 
 ;; Mullvad VPN account commands
 (defun mullvadel-account-create ()
   "Create and log in on a new account."
   (interactive)
-  (mullvadel-cli-command-run '("account" "create")))
+  (mullvadel-process-create '("account" "create"))
+  (process-live-p mullvadel-process))
 
 (defun mullvadel-account-login ()
   "Log in on an account."
   (interactive)
-  (mullvadel-cli-command-run '("account" "login")))
+  (mullvadel-process-create '("account" "login"))
+  (if (process-live-p mullvadel-process)
+      (let ((account-number (read-string (concat mullvadel-process-output " "))))
+        (mullvadel-process-send (concat account-number "\n")))
+    mullvadel-process-output))
 
 (defun mullvadel-account-logout ()
   "Log out of the current account."
   (interactive)
-  (mullvadel-cli-command-run '("account" "logout")))
+  (mullvadel-process-create '("account" "logout"))
+  mullvadel-process-output)
 
 (defun mullvadel-account-get ()
   "Display information about the current account."
   (interactive)
-  (mullvadel-cli-command-run '("account" "get")))
+  (mullvadel-shell-to-string '("account" "get")))
 
 ;; Mullvad VPN auto-connect commands
 (defun mullvadel-auto-connect-get ()
@@ -104,46 +125,186 @@
   (interactive)
   (mullvadel-cli-command-run '("beta-program" "set")))
 
+(defvar mullvadel-connected nil "VPN tunnel connected?")
+
 (defun mullvadel-connectedp ()
-  "Return t if the connected state of the VPN tunnel is \"Connected\"."
+  "Check the connected state of the Mullvad VPN tunnel."
   (let ((output (mullvadel-status)))
     (if (equal (car (string-split output "\n")) "Connected")
-        t
-        nil)))
+        (progn
+          (setq mullvadel-connected t)
+          (propertize "Connected"
+                      'face 'success))
+      (progn
+        (setq mullvadel-connected nil)
+        (propertize "Disconnected"
+                    'face 'error)))))
+
+(defun mullvadel-status-features (regexp)
+  "Check your Mullvad VPN status specified by REGEXP."
+  (let* ((output (mullvadel-status))
+         (seq (split-string output "\n"))
+         (matches (mapcar (lambda (str) (string-match-p regexp str)) seq))
+         (idx (cl-position-if
+               (lambda (v) (or v))
+               matches))
+         (offset (if idx (elt matches idx) nil))
+         (str (if offset (replace-regexp-in-string ":[[:space:]]*" ": " (substring (elt seq idx) offset)) nil)))
+    str))
+
+(defun mullvadel-visible-location ()
+  "Check your percieved visible location from Mullvad VPN."
+  (or (mullvadel-status-features "Visible location:[[:space:]]*[a-zA-Z0-9-.,: ]+") "Visible location: None"))
+
+(defun mullvadel-relay ()
+  "Check your currently used relay from Mullvad VPN, nil if not connected."
+  (or (mullvadel-status-features "Relay:[[:space:]]*[a-zA-Z0-9-]+") "Relay: None"))
+
+(defun mullvadel-features ()
+  "Check the features provided by the connected Mullvad VPN relay."
+  (or (mullvadel-status-features "Features:[[:space:]]*[a-zA-Z0-9 ]+") "Features: None"))
+
+(transient-define-prefix mullvadel-account-menu ()
+  "Mullvad VPN Account Commands"
+  ["Account Commands" :description "Mullvad VPN Account Commands"
+   ("c" "create" mullvadel-account-get
+    :description "Create and log in on a new account.")
+   ("l" "login" mullvadel-account-get
+    :description "Log in on an account.")
+   ("L" "list-devices" mullvadel-account-get
+    :description "List devices associated with an account.")
+   ("r" "redeem" mullvadel-account-get
+    :description "Redeem a voucher.")
+   ("R" "list-devices" mullvadel-account-get
+    :description "Revoke a device associated with an account.")
+   ("o" "logout" mullvadel-account-get
+    :description "Log out of the current account.")
+   ("g" "get" mullvadel-account-get
+    :description "Display information about the current account.")])
+
+(transient-define-prefix mullvadel-undefined-menu ()
+  "Undefined prefix."
+  ["TODO: This menu is undefined." :description "TODO: Need to implement this feature."
+   (:info "This menu is empty.")])
 
 (transient-define-prefix mullvadel-menu ()
   "Mullvad VPN commands."
+  ["General" :description "Mullvad VPN Status."
+    (:info #'mullvadel-connectedp)
+    (:info #'mullvadel-visible-location)
+    (:info #'mullvadel-features)
+    (:info #'mullvadel-relay)]
   ["Mullvad VPN commands"
-   ["General" :description "Display general information."
-    ("s" "status" mullvadel-status :description "Return the state of the VPN tunnel.")]
-   ["account" :description "Control and display information about your Mullvad account."
-    ("ac" "create" mullvadel-account-create :description "Create and log in on a new account.")
-    ("ai" "login" mullvadel-account-login :description "Log in on an account.")
-    ("ao" "logout" mullvadel-account-logout :description "Log out of the current account.")
-    ("ag" "get" mullvadel-account-get :description "Display information about the current account.")]
-   ["auto-connect" :description "Control the daemon auto-connect setting."
-    ("ug" "get" mullvadel-auto-connect-get :description "Display the current auto-connect setting.")
-    ("us" "set" mullvadel-auto-connect-set :description "Change auto-connect setting.")]])
+   [("a" "account"
+    mullvadel-account-menu
+    :description "Control and display information about your Mullvad account.")
+   ("A" "auto-connect"
+    mullvadel-undefined-menu
+    :description "Control the daemon auto-connect setting.")
+   ("b" "beta-program"
+    mullvadel-undefined-menu
+    :description "Receive notifications about beta updates.")
+   ("B" "bridge"
+    mullvadel-undefined-menu
+    :description "Manage use of bridges, socks proxies and Shadowsocks for OpenVPN.")
+   ("c" "connect"
+    mullvadel-undefined-menu
+    :description "Connect to a VPN relay.")
+   ("d" "disconnect"
+    mullvadel-undefined-menu
+    :description "Disconnect from the VPN.")
+   ("D" "dns"
+    mullvadel-undefined-menu
+    :description "Configure DNS servers to use when connected.")
+   ("E" "export-settings"
+    mullvadel-undefined-menu
+    :description "Export a JSON patch based on the current settings.")
+   ("F" "factory-reset"
+    mullvadel-undefined-menu
+    :description "Reset settings, caches, and logs.")
+   ("r" "reconnect"
+    mullvadel-undefined-menu
+    :description "Reconnect to any matching VPN relay.")]
+   [("R" "relay"
+    mullvadel-undefined-menu
+    :description "Manage relay and tunnel constraints.")
+   ("u" "custom-list"
+    mullvadel-undefined-menu
+    :description "Manage custom lists.")
+   ("i" "api-access"
+    mullvadel-undefined-menu
+    :description "Manage Mullvad API access methods.")
+   ("I" "import-settings"
+    mullvadel-undefined-menu
+    :description "Apply a JSON patch generated by 'export-settings'.")
+   ("o" "obfuscation"
+    mullvadel-undefined-menu
+    :description "Manage use of obfuscation protocols for WireGuard.")
+   ("s" "split-tunnel"
+    mullvadel-undefined-menu
+    :description "Manage split tunneling.")
+   ("t" "tunnel"
+    mullvadel-undefined-menu
+    :description "Manage tunnel options.")
+   ("l" "lockdown-mode"
+    mullvadel-undefined-menu
+    :description "Control whether to block network access when disconnected from VPN.")
+   ("L" "lan"
+    mullvadel-undefined-menu
+    :description "Control the allow local network sharing setting.")
+   ("v" "version"
+    mullvadel-undefined-menu
+    :description "Manage tunnel options.")]])
 
-(provide 'mullvadel)
-;;; mullvadel.el ends here
+; TODO Need to balance the sentinel and filter to communicate correctly.
+; the listen filter may not be finished sending output to the process buffer.
+; So need to figure out a way to know when all data has truly been written.
+(defun mullvadel-listen-sentinel (proc string)
+  "Listen sentinel for PROC with output STRING."
+  (when (memq (process-status proc) '(exit signal))
+    (with-current-buffer mullvadel-process-buffer
+      (setq mullvadel-process-output (mullvadel-process-buffer-string))
+      (erase-buffer))))
 
-(defun mullvadel-account-get ()
-  "Display information about the current account."
-  (mullvadel-cli-command-run '("account" "get")))
+(defun mullvadel-listen-filter (proc string)
+  "Listen filter for PROC with output STRING."
+  (with-current-buffer (process-buffer proc)
+    (goto-char (process-mark proc))
+    (setq mullvadel-process-output
+          (string-trim-right (replace-regexp-in-string "\"" "" string)))
+    (insert string)))
 
-(transient-define-prefix mullvadel-menu ()
-  "Mullvad VPN CLI commands."
-  [["account" ; Account related commands
-    ("a" "create" mullvadel-account-create)
-    ("i" "login" mullvadel-account-login)
-    ("l" "logout" mullvadel-account-logout)
-    ("g" "get" mullvadel-account-get)
-    ]])
+;; TODO fix this code for handling the output of the process.
+;; Should realistically try and avoid `sleep-for' and see if there
+;; is a better method by having `filter' and `sentinel' communicate
+;; in some way.
+(defun mullvadel-process-create (args)
+  "Create a process instance of the Mullvad VPN CLI with ARGS."
+  (interactive)
+  (if (process-live-p mullvadel-process)
+      (kill-process mullvadel-process))
+  (setq mullvadel-process (make-process
+                           :name mullvadel-cli-path
+                           :buffer mullvadel-process-buffer
+                           :command (append (list mullvadel-cli-path) args)
+                           :sentinel 'mullvadel-listen-sentinel
+                           :filter 'mullvadel-listen-filter)))
 
+(defun mullvadel-shell-to-string (args)
+  "Execute mullvadel with ARGS as a shell command and return its output as a string."
+  (shell-command-to-string
+   (mapconcat #'append (append (list mullvadel-cli-path) args) " ")))
 
+(defun mullvadel-process-send (input)
+  "Send INPUT to the `mullvadel-process'."
+  (process-send-string mullvadel-process input)
+  (while (accept-process-output mullvadel-process 0.2))
+  mullvadel-process-output)
 
-(mullvadel-cli-command-run '("account" "get"))
+(defun mullvadel-process-buffer-string ()
+  "Get the text inside of `mullvadel-process-buffer'."
+  (with-current-buffer mullvadel-process-buffer
+    (string-trim-right (replace-regexp-in-string "\"" "" (buffer-string)))))
 
 (provide 'mullvadel)
 ;;; mullvadel.el ends here
