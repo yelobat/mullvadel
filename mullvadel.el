@@ -47,20 +47,102 @@
 (defvar mullvadel-process nil)
 (defvar mullvadel-process-output nil)
 
+(defvar mullvadel-funcall-cache nil)
+(defvar mullvadel-funcall-cache-source nil)
+(defvar mullvadel-funcall-cache-valid-for 5)
+(defun mullvadel-funcall-cache-validp ()
+  "Check whether the function call cache is valid to read from."
+  (if mullvadel-funcall-cache t nil))
+
+(defun mullvadel-funcall-cache-set-timer ()
+  "Set the mullvadel funcall cache timer to start."
+  (run-at-time mullvadel-funcall-cache-valid-for nil
+               #'mullvadel-funcall-cache-invalidate))
+
+(defun mullvadel-funcall-cache-update (function)
+  "Update the mullvadel function call cache with FUNCTION."
+  (setq mullvadel-funcall-cache (funcall function))
+  (setq mullvadel-funcall-cache-source (symbol-name function))
+  (mullvadel-funcall-cache-set-timer)
+  mullvadel-funcall-cache)
+
+(defun mullvadel-funcall-cache-update-or-retrieve (function)
+  "Update the mullvadel function call cache iff it is invalid with FUNCTION."
+  (if (and (mullvadel-funcall-cache-validp) (symbol-name function))
+      mullvadel-funcall-cache
+    (mullvadel-funcall-cache-update function)))
+
+(defun mullvadel-funcall-cache-invalidate ()
+  "Invalidate the mullvadel function call cache."
+  (setq mullvadel-funcall-cache nil)
+  (setq mullvadel-funcall-cache-source nil))
+
+(mullvadel-funcall-cache-update-or-retrieve #'mullvadel-account-get)
+
 (defun mullvadel-message (format-string &rest args)
-  "Display FORMAT-STRING in `mullvadel-buffer'."
+  "Display FORMAT-STRING in `mullvadel-buffer' with ARGS."
   (with-current-buffer mullvadel-buffer
     (goto-char (point-max))
     (insert (apply 'format (concat "Mullvad: " format-string "\n") args))))
 
 (defun mullvadel-error (format-string &rest args)
-  "Display FORMAT-STRING in `mullvadel-error-buffer'."
+  "Display FORMAT-STRING in `mullvadel-error-buffer' with ARGS."
   (with-current-buffer mullvadel-error-buffer
     (goto-char (point-max))
     (insert (apply 'format (concat "Mullvad Error: " format-string "\n") args))))
 
+; TODO Need to balance the sentinel and filter to communicate correctly.
+; the listen filter may not be finished sending output to the process buffer.
+; So need to figure out a way to know when all data has truly been written.
+(defun mullvadel-listen-sentinel (proc string)
+  "Listen sentinel for PROC with output STRING."
+  (when (memq (process-status proc) '(exit signal))
+    (with-current-buffer mullvadel-process-buffer
+      (setq mullvadel-process-output (mullvadel-process-buffer-string))
+      (erase-buffer))))
+
+(defun mullvadel-listen-filter (proc string)
+  "Listen filter for PROC with output STRING."
+  (with-current-buffer (process-buffer proc)
+    (goto-char (process-mark proc))
+    (setq mullvadel-process-output
+          (string-trim-right (replace-regexp-in-string "\"" "" string)))
+    (insert string)))
+
+;; TODO fix this code for handling the output of the process.
+;; Should realistically try and avoid `sleep-for' and see if there
+;; is a better method by having `filter' and `sentinel' communicate
+;; in some way.
+(defun mullvadel-process-create (args)
+  "Create a process instance of the Mullvad VPN CLI with ARGS."
+  (interactive)
+  (if (process-live-p mullvadel-process)
+      (kill-process mullvadel-process))
+  (setq mullvadel-process (make-process
+                           :name mullvadel-cli-path
+                           :buffer mullvadel-process-buffer
+                           :command (append (list mullvadel-cli-path) args)
+                           :sentinel 'mullvadel-listen-sentinel
+                           :filter 'mullvadel-listen-filter)))
+
+(defun mullvadel-shell-to-string (args)
+  "Execute mullvadel with ARGS as a shell command and return its output as a string."
+  (shell-command-to-string
+   (mapconcat #'append (append (list mullvadel-cli-path) args) " ")))
+
+(defun mullvadel-process-send (input)
+  "Send INPUT to the `mullvadel-process'."
+  (process-send-string mullvadel-process input)
+  (while (accept-process-output mullvadel-process 0.2))
+  mullvadel-process-output)
+
+(defun mullvadel-process-buffer-string ()
+  "Get the text inside of `mullvadel-process-buffer'."
+  (with-current-buffer mullvadel-process-buffer
+    (string-trim-right (replace-regexp-in-string "\"" "" (buffer-string)))))
+
 (defun mullvadel-cli-command-run (args)
-  "Run a Mullvad VPN CLI command."
+  "Run a Mullvad VPN CLI command with ARGS."
   (let* ((command (concat mullvadel-cli-path " " (mapconcat 'shell-quote-argument args " "))))
     (mullvadel-message "Running Mullvad CLI: %s" command)
     (condition-case err
@@ -152,6 +234,22 @@
          (str (if offset (replace-regexp-in-string ":[[:space:]]*" ": " (substring (elt seq idx) offset)) nil)))
     str))
 
+(defun mullvadel-region-from-regexp (content regexp)
+  "Extract line based on REGEXP."
+  (let* ((str (if (functionp content) (funcall content) content))
+         (seq (split-string str "\n"))
+         (matches (mapcar (lambda (str) (string-match-p regexp str)) seq))
+         (idx (cl-position-if
+               (lambda (v) (or v))
+               matches))
+         (offset (if idx (elt matches idx) nil))
+         (str (if offset (substring (elt seq idx) offset) nil)))
+    str))
+
+(defun mullvadel-trim-inner-ws (content)
+  "Remove inner whitespace from CONTENT."
+  (replace-regexp-in-string ":[[:space:]]+" ": " content))
+
 (defun mullvadel-visible-location ()
   "Check your percieved visible location from Mullvad VPN."
   (or (mullvadel-status-features "Visible location:[[:space:]]*[a-zA-Z0-9-.,: ]+") "Visible location: None"))
@@ -164,10 +262,30 @@
   "Check the features provided by the connected Mullvad VPN relay."
   (or (mullvadel-status-features "Features:[[:space:]]*[a-zA-Z0-9 ]+") "Features: None"))
 
+;; TODO Implement this for each command so that the output of a command
+;; is display inside of a transient menu.
+(transient-define-prefix mullvadel-account-get-prefix ()
+  ["Mullvad Account Get" :description "Display information about the current account."
+    (:info (lambda ()
+             (mullvadel-trim-inner-ws
+              (mullvadel-region-from-regexp
+               (mullvadel-funcall-cache-update-or-retrieve #'mullvadel-account-get)
+               "Mullvad account:[[:space:]]*[a-zA-Z0-9-.,: ]+"))))
+    (:info (lambda ()
+             (mullvadel-trim-inner-ws
+              (mullvadel-region-from-regexp
+               (mullvadel-funcall-cache-update-or-retrieve #'mullvadel-account-get)
+               "Expires at:[[:space:]]*[a-zA-Z0-9-.,: ]+"))))
+    (:info (lambda ()
+             (mullvadel-trim-inner-ws
+              (mullvadel-region-from-regexp
+               (mullvadel-funcall-cache-update-or-retrieve #'mullvadel-account-get)
+               "Device name:[[:space:]]*[a-zA-Z0-9-.,: ]+"))))])
+
 (transient-define-prefix mullvadel-account-menu ()
   "Mullvad VPN Account Commands"
   ["Account Commands" :description "Mullvad VPN Account Commands"
-   ("c" "create" mullvadel-account-get
+   ("c" "create" mullvadel-account-get-prefix
     :description "Create and log in on a new account.")
    ("l" "login" mullvadel-account-get
     :description "Log in on an account.")
@@ -256,55 +374,7 @@
     mullvadel-undefined-menu
     :description "Manage tunnel options.")]])
 
-; TODO Need to balance the sentinel and filter to communicate correctly.
-; the listen filter may not be finished sending output to the process buffer.
-; So need to figure out a way to know when all data has truly been written.
-(defun mullvadel-listen-sentinel (proc string)
-  "Listen sentinel for PROC with output STRING."
-  (when (memq (process-status proc) '(exit signal))
-    (with-current-buffer mullvadel-process-buffer
-      (setq mullvadel-process-output (mullvadel-process-buffer-string))
-      (erase-buffer))))
 
-(defun mullvadel-listen-filter (proc string)
-  "Listen filter for PROC with output STRING."
-  (with-current-buffer (process-buffer proc)
-    (goto-char (process-mark proc))
-    (setq mullvadel-process-output
-          (string-trim-right (replace-regexp-in-string "\"" "" string)))
-    (insert string)))
-
-;; TODO fix this code for handling the output of the process.
-;; Should realistically try and avoid `sleep-for' and see if there
-;; is a better method by having `filter' and `sentinel' communicate
-;; in some way.
-(defun mullvadel-process-create (args)
-  "Create a process instance of the Mullvad VPN CLI with ARGS."
-  (interactive)
-  (if (process-live-p mullvadel-process)
-      (kill-process mullvadel-process))
-  (setq mullvadel-process (make-process
-                           :name mullvadel-cli-path
-                           :buffer mullvadel-process-buffer
-                           :command (append (list mullvadel-cli-path) args)
-                           :sentinel 'mullvadel-listen-sentinel
-                           :filter 'mullvadel-listen-filter)))
-
-(defun mullvadel-shell-to-string (args)
-  "Execute mullvadel with ARGS as a shell command and return its output as a string."
-  (shell-command-to-string
-   (mapconcat #'append (append (list mullvadel-cli-path) args) " ")))
-
-(defun mullvadel-process-send (input)
-  "Send INPUT to the `mullvadel-process'."
-  (process-send-string mullvadel-process input)
-  (while (accept-process-output mullvadel-process 0.2))
-  mullvadel-process-output)
-
-(defun mullvadel-process-buffer-string ()
-  "Get the text inside of `mullvadel-process-buffer'."
-  (with-current-buffer mullvadel-process-buffer
-    (string-trim-right (replace-regexp-in-string "\"" "" (buffer-string)))))
 
 (provide 'mullvadel)
 ;;; mullvadel.el ends here
