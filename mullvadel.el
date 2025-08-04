@@ -68,7 +68,7 @@
 
 (defun mullvadel-funcall-cache-update-or-retrieve (function)
   "Update the mullvadel function call cache iff it is invalid with FUNCTION."
-  (if (and (mullvadel-funcall-cache-validp) (symbol-name function))
+  (if (and (mullvadel-funcall-cache-validp) (equal (symbol-name function) mullvadel-funcall-cache-source))
       mullvadel-funcall-cache
     (mullvadel-funcall-cache-update function)))
 
@@ -77,7 +77,29 @@
   (setq mullvadel-funcall-cache nil)
   (setq mullvadel-funcall-cache-source nil))
 
-(mullvadel-funcall-cache-update-or-retrieve #'mullvadel-account-get)
+(defvar mullvadel-data-cache nil)
+(defvar mullvadel-data-cache-source nil)
+(defvar mullvadel-data-cache-valid-for 5)
+(defun mullvadel-data-cache-validp ()
+  "Check whether the data cache is valid to read from."
+  (if mullvadel-data-cache t nil))
+
+(defun mullvadel-data-cache-set-timer ()
+  "Set the mullvadel data cache timer to start."
+  (run-at-time mullvadel-data-cache-valid-for nil
+               #'mullvadel-data-cache-invalidate))
+
+(defun mullvadel-data-cache-update (name data)
+  "Update the mullvadel data cache with DATA with label NAME."
+  (setq mullvadel-data-cache data)
+  (setq mullvadel-data-cache-source name)
+  (mullvadel-data-cache-set-timer)
+  mullvadel-data-cache)
+
+(defun mullvadel-data-cache-invalidate ()
+  "Invalidate the mullvadel function call cache."
+  (setq mullvadel-data-cache nil)
+  (setq mullvadel-data-cache-source nil))
 
 (defun mullvadel-message (format-string &rest args)
   "Display FORMAT-STRING in `mullvadel-buffer' with ARGS."
@@ -126,7 +148,7 @@
                            :filter 'mullvadel-listen-filter)))
 
 (defun mullvadel-shell-to-string (args)
-  "Execute mullvadel with ARGS as a shell command and return its output as a string."
+  "Execute mullvadel with ARGS as a shell command, return string."
   (shell-command-to-string
    (mapconcat #'append (append (list mullvadel-cli-path) args) " ")))
 
@@ -234,17 +256,19 @@
          (str (if offset (replace-regexp-in-string ":[[:space:]]*" ": " (substring (elt seq idx) offset)) nil)))
     str))
 
-(defun mullvadel-region-from-regexp (content regexp)
-  "Extract line based on REGEXP."
-  (let* ((str (if (functionp content) (funcall content) content))
+(defun mullvadel-line-from-regexp (content regexp)
+  "Extract line from CONTENT based on REGEXP."
+  (let* ((str (if (functionp content) (mullvadel-funcall-cache-update-or-retrieve content) content))
          (seq (split-string str "\n"))
          (matches (mapcar (lambda (str) (string-match-p regexp str)) seq))
          (idx (cl-position-if
                (lambda (v) (or v))
                matches))
          (offset (if idx (elt matches idx) nil))
-         (str (if offset (substring (elt seq idx) offset) nil)))
-    str))
+         (output (if offset (mullvadel-trim-inner-ws (substring (elt seq idx) offset)) nil)))
+    (mullvadel-message str)
+    (mullvadel-message output)
+    output))
 
 (defun mullvadel-trim-inner-ws (content)
   "Remove inner whitespace from CONTENT."
@@ -252,15 +276,18 @@
 
 (defun mullvadel-visible-location ()
   "Check your percieved visible location from Mullvad VPN."
-  (or (mullvadel-status-features "Visible location:[[:space:]]*[a-zA-Z0-9-.,: ]+") "Visible location: None"))
+  (or (mullvadel-line-from-regexp #'mullvadel-status "Visible location:[[:space:]]*[a-zA-Z0-9-.,: ]+")
+      "Visible location: None"))
 
 (defun mullvadel-relay ()
   "Check your currently used relay from Mullvad VPN, nil if not connected."
-  (or (mullvadel-status-features "Relay:[[:space:]]*[a-zA-Z0-9-]+") "Relay: None"))
+  (or (mullvadel-line-from-regexp #'mullvadel-status "Relay:[[:space:]]*[a-zA-Z0-9-]+")
+      "Relay: None"))
 
 (defun mullvadel-features ()
   "Check the features provided by the connected Mullvad VPN relay."
-  (or (mullvadel-status-features "Features:[[:space:]]*[a-zA-Z0-9 ]+") "Features: None"))
+  (or (mullvadel-line-from-regexp #'mullvadel-status "Features:[[:space:]]*[a-zA-Z0-9 ]+")
+      "Features: None"))
 
 ;; TODO Implement this for each command so that the output of a command
 ;; is display inside of a transient menu.
@@ -268,17 +295,17 @@
   ["Mullvad Account Get" :description "Display information about the current account."
     (:info (lambda ()
              (mullvadel-trim-inner-ws
-              (mullvadel-region-from-regexp
+              (mullvadel-line-from-regexp
                (mullvadel-funcall-cache-update-or-retrieve #'mullvadel-account-get)
                "Mullvad account:[[:space:]]*[a-zA-Z0-9-.,: ]+"))))
     (:info (lambda ()
              (mullvadel-trim-inner-ws
-              (mullvadel-region-from-regexp
+              (mullvadel-line-from-regexp
                (mullvadel-funcall-cache-update-or-retrieve #'mullvadel-account-get)
                "Expires at:[[:space:]]*[a-zA-Z0-9-.,: ]+"))))
     (:info (lambda ()
              (mullvadel-trim-inner-ws
-              (mullvadel-region-from-regexp
+              (mullvadel-line-from-regexp
                (mullvadel-funcall-cache-update-or-retrieve #'mullvadel-account-get)
                "Device name:[[:space:]]*[a-zA-Z0-9-.,: ]+"))))])
 
@@ -373,8 +400,6 @@
    ("v" "version"
     mullvadel-undefined-menu
     :description "Manage tunnel options.")]])
-
-
 
 (provide 'mullvadel)
 ;;; mullvadel.el ends here
