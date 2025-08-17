@@ -1,3 +1,5 @@
-# Mullvad.el - A Mullvad VPN interface for Emacs.
+# Mullvad.el - A Transient Interface for Mullvad VPN in Emacs.
+
+
 
 
